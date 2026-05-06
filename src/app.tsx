@@ -1338,6 +1338,14 @@ function App({
       }
       return;
     }
+    if (key.ctrl && inputChar === "z") {
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stdout.write("\n");
+      process.kill(process.pid, "SIGSTOP");
+      return;
+    }
     if (key.escape) {
       const modalOpen =
         perm !== null ||
@@ -3479,5 +3487,17 @@ export async function renderApp(
       incrementalRendering: true,
     },
   );
+
+  const onSigcont = () => {
+    if (process.stdin.isTTY) {
+      (process.stdin as import("node:tty").ReadStream).setRawMode(true);
+    }
+    setTimeout(() => {
+      instance.clear();
+    }, 50);
+  };
+  process.on("SIGCONT", onSigcont);
+
   await instance.waitUntilExit();
+  process.off("SIGCONT", onSigcont);
 }

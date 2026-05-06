@@ -10,6 +10,8 @@ import type { Mode } from "../mode.js";
 import { calculateCost } from "../pricing.js";
 import type { DailyUsage } from "../usage-tracker.js";
 
+export type TurnPhase = "generating" | "executing" | "waiting";
+
 interface Props {
   model: string;
   usage: Usage | null;
@@ -25,9 +27,18 @@ interface Props {
   codeMode?: boolean;
   cloudMode?: boolean;
   cloudBudget?: { remaining: number; limit: number } | null;
+  /** Number of skills active this turn */
+  skillsActive?: number;
+  /** Whether memory was recalled this turn */
+  memoryRecalled?: boolean;
+  phase?: TurnPhase;
+  currentTool?: string | null;
+  lastActivityAt?: number | null;
+  kimiMdStale?: boolean;
+  gitBranch?: string | null;
 }
 
-export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt, mode, effort, contextLimit, hasUpdate, latestVersion, gatewayMeta, codeMode, cloudMode, cloudBudget }: Props) {
+export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt, mode, effort, contextLimit, hasUpdate, latestVersion, gatewayMeta, codeMode, cloudMode, cloudBudget, skillsActive, memoryRecalled, phase, currentTool, lastActivityAt, kimiMdStale, gitBranch }: Props) {
   const theme = useTheme();
   const [now, setNow] = useState(Date.now());
   const modeColor =
@@ -43,8 +54,20 @@ export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt,
   const elapsed = turnStartedAt !== null ? formatElapsed(now - turnStartedAt) : null;
 
   const leftParts: string[] = [`${shortModel(model)}`, effort];
+  if (gitBranch) leftParts.push(gitBranch);
   if (cloudMode) leftParts.push("CLOUD");
   if (codeMode) leftParts.push("CODE");
+
+  const labelParts: string[] = [];
+  if (skillsActive !== undefined && skillsActive > 0) {
+    labelParts.push(`${skillsActive} skill${skillsActive === 1 ? "" : "s"} on deck`);
+  }
+  if (memoryRecalled) {
+    labelParts.push("Memory recalled");
+  }
+  const phaseLabel = phase === "generating" ? "generating" : phase === "executing" ? `executing ${currentTool ?? ""}` : phase === "waiting" ? "waiting" : "thinking";
+  const idleMs = lastActivityAt && thinking ? now - lastActivityAt : 0;
+  const idleLabel = idleMs > 30_000 ? ` (idle ${formatElapsed(Math.floor(idleMs / 1000))})` : "";
 
   return (
     <Box flexDirection="column">
@@ -56,7 +79,7 @@ export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt,
         {thinking ? (
           <Text color={theme.spinner}>
             <Spinner type="dots" />{" "}
-            thinking{elapsed ? ` · ${elapsed}` : ""}
+            {phaseLabel}{elapsed ? ` · ${elapsed}` : ""}{idleLabel}
           </Text>
         ) : (
           <Text color={theme.info.color} >
@@ -64,6 +87,13 @@ export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt,
           </Text>
         )}
       </Box>
+      {labelParts.length > 0 && (
+        <Box>
+          <Text color={theme.info.color} dimColor>
+            {labelParts.join("  ·  ")}
+          </Text>
+        </Box>
+      )}
       {usage && (
         <Box>
           <Text color={theme.info.color} >
@@ -79,6 +109,18 @@ export function StatusBar({ model, usage, sessionUsage, thinking, turnStartedAt,
               {"  ·  "}update available{latestVersion ? ` → ${latestVersion}` : ""} · run /update
             </Text>
           ) : null}
+          {kimiMdStale ? (
+            <Text color={theme.warn} bold>
+              {"  ·  "}⚠ KIMI.md stale · run /init
+            </Text>
+          ) : null}
+        </Box>
+      )}
+      {!thinking && (
+        <Box>
+          <Text color={theme.muted?.color ?? theme.info.color} dimColor={theme.muted?.dim}>
+            tip: shift+tab cycles mode
+          </Text>
         </Box>
       )}
     </Box>

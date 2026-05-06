@@ -42,7 +42,6 @@ import { checkForUpdate } from "./util/update-check.js";
 import type { UpdateCheckResult } from "./util/update-check.js";
 import { Onboarding } from "./ui/onboarding.js";
 import { Welcome } from "./ui/welcome.js";
-import { HelpMenu } from "./ui/help-menu.js";
 import {
   configPath,
   DEFAULT_MODEL,
@@ -58,6 +57,8 @@ import { authGitHubForTui } from "./remote/tui-auth.js";
 import { RemoteDashboard, RemoteSessionDetail } from "./ui/remote-dashboard.js";
 import { nextMode, type Mode, isBlockedInPlanMode, isReadOnlyBash } from "./mode.js";
 import { classifyIntent } from "./intent/classify.js";
+import { routeSkills, type SkillRoutingResult } from "./skills/index.js";
+import { listAllSkills, createSkill, deleteSkill, setSkillEnabled, findSkillFile } from "./skills/manager.js";
 import {
   listSessions,
   loadSession,
@@ -90,6 +91,7 @@ import { LspWizard } from "./ui/lsp-wizard.js";
 import { ThemeProvider } from "./ui/theme-context.js";
 import { ThemePicker } from "./ui/theme-picker.js";
 import { resolveTheme, themeList, themeNames, DEFAULT_THEME_NAME } from "./ui/theme.js";
+import { loadAndMergeThemes } from "./ui/theme-loader.js";
 import type { Theme } from "./ui/theme.js";
 import { saveProjectLspConfig, type ResolvedLspConfig } from "./util/lsp-config.js";
 import { maybeLspNudge } from "./util/lsp-nudge.js";
@@ -374,6 +376,14 @@ function detectGitHubRepo(cachedRepo?: string): { owner: string; name: string } 
   return null;
 }
 
+function detectGitBranch(): string | null {
+  try {
+    return execSync("git branch --show-current", { cwd: process.cwd(), encoding: "utf8" }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
@@ -530,7 +540,6 @@ function App({
     initialCfg?.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
   );
   const [resumeSessions, setResumeSessions] = useState<SessionSummary[] | null>(null);
-  const [showHelpMenu, setShowHelpMenu] = useState(false);
   const [commandWizard, setCommandWizard] = useState<{ mode: "create" | "edit"; initial?: CustomCommand } | null>(null);
   const [commandPicker, setCommandPicker] = useState<{ mode: "edit" | "delete" } | null>(null);
   const [commandToDelete, setCommandToDelete] = useState<CustomCommand | null>(null);
@@ -542,12 +551,48 @@ function App({
   const [tasksStartedAt, setTasksStartedAt] = useState<number | null>(null);
   const [tasksStartTokens, setTasksStartTokens] = useState<number>(0);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
+  const [turnPhase, setTurnPhase] = useState<import("./ui/status.js").TurnPhase>("waiting");
+  const [currentToolName, setCurrentToolName] = useState<string | null>(null);
+  const [lastActivityAt, setLastActivityAt] = useState<number | null>(null);
   const [verbose, setVerbose] = useState(false);
   const [hasUpdate, setHasUpdate] = useState(initialUpdateResult?.hasUpdate ?? false);
   const [latestVersion, setLatestVersion] = useState<string | null>(initialUpdateResult?.latestVersion ?? null);
   const [theme, setTheme] = useState<Theme>(resolveTheme(initialCfg?.theme));
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [originalTheme, setOriginalTheme] = useState<Theme | null>(null);
+  const [skillsActive, setSkillsActive] = useState(0);
+  const [memoryRecalled, setMemoryRecalled] = useState(false);
+  const [intentTier, setIntentTier] = useState<"light" | "medium" | "heavy" | null>(null);
+  const skillsDirRef = useRef(join(process.cwd(), ".kimiflare", "skills"));
+  const [kimiMdStale, setKimiMdStale] = useState(false);
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
+
+  useEffect(() => {
+    setGitBranch(detectGitBranch());
+  }, []);
+
+  // Load user and project themes at startup
+  useEffect(() => {
+    let cancelled = false;
+    loadAndMergeThemes().then(({ errors, wcagWarnings }) => {
+      if (cancelled) return;
+      if (errors.length > 0) {
+        setEvents((e) => [
+          ...e,
+          { kind: "error", key: mkKey(), text: `theme load errors:\n${errors.join("\n")}` },
+        ]);
+      }
+      if (wcagWarnings.length > 0) {
+        setEvents((e) => [
+          ...e,
+          { kind: "info", key: mkKey(), text: `theme WCAG warnings:\n${wcagWarnings.join("\n")}` },
+        ]);
+      }
+      // Re-resolve current theme in case a user/project theme overrides the built-in
+      setTheme(resolveTheme(initialCfg?.theme));
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Fetch cloud token budget on startup
   useEffect(() => {
@@ -603,7 +648,8 @@ function App({
   const busyRef = useRef(busy);
   const memoryManagerRef = useRef<MemoryManager | null>(null);
   const sessionStartRecallRef = useRef<Promise<void> | null>(null);
-
+  const kimiMdStaleNudgedRef = useRef(false);
+  const turnCounterRef = useRef(0);
 
   // Batched streaming delta refs to reduce React re-render frequency
   const pendingTextRef = useRef<Map<number, { text: string; reasoning: string }>>(new Map());
@@ -779,7 +825,6 @@ function App({
   // picker state would survive the modal and re-render on close.
   useEffect(() => {
     const modalActive =
-      showHelpMenu ||
       commandWizard !== null ||
       commandPicker !== null ||
       commandToDelete !== null ||
@@ -792,7 +837,6 @@ function App({
       setActivePicker(null);
     }
   }, [
-    showHelpMenu,
     commandWizard,
     commandPicker,
     commandToDelete,
@@ -891,6 +935,16 @@ function App({
           // Non-fatal: session works fine without recalled memories
         }
       })();
+
+      // Session-start drift check (Trigger A): if KIMI.md exists and high-signal
+      // memories have been learned since the last refresh, mark as stale.
+      if (existsSync(join(cwd, "KIMI.md"))) {
+        const lastRefresh = manager.getLastKimiMdRefreshTime(cwd);
+        const driftCount = manager.countHighSignalMemoriesSince(cwd, lastRefresh);
+        if (driftCount >= 5) {
+          setKimiMdStale(true);
+        }
+      }
     } else {
       memoryManagerRef.current?.close();
       memoryManagerRef.current = null;
@@ -1350,12 +1404,12 @@ function App({
       const modalOpen =
         perm !== null ||
         limitModal !== null ||
-        showHelpMenu ||
         showLspWizard ||
         showCommandList ||
         commandWizard !== null ||
         commandToDelete !== null ||
-        resumeSessions !== null;
+        resumeSessions !== null ||
+        showThemePicker;
       if (!modalOpen && busyRef.current && activeControllerRef.current) {
         if (permResolveRef.current) {
           permResolveRef.current("deny");
@@ -1538,6 +1592,9 @@ function App({
     } finally {
       setBusy(false);
       setTurnStartedAt(null);
+      setTurnPhase("waiting");
+      setCurrentToolName(null);
+      setLastActivityAt(null);
       activeControllerRef.current = null;
       permResolveRef.current = null;
       limitResolveRef.current = null;
@@ -1713,6 +1770,16 @@ function App({
               permResolveRef.current = resolve;
               setPerm({ tool: req.tool, args: req.args, resolve });
             }),
+          onKimiMdStale: () => {
+            if (!kimiMdStaleNudgedRef.current) {
+              kimiMdStaleNudgedRef.current = true;
+              setKimiMdStale(true);
+              setEvents((e) => [
+                ...e,
+                { kind: "info", key: mkKey(), text: "Project context may be stale. Run /init to refresh KIMI.md based on recent changes." },
+              ]);
+            }
+          },
         },
       });
 
@@ -1742,6 +1809,10 @@ function App({
           ...e,
           { kind: "info", key: mkKey(), text: "KIMI.md generated; context loaded for future turns" },
         ]);
+        // Record refresh so drift detection knows this snapshot is current
+        void memoryManagerRef.current?.recordKimiMdRefresh(cwd, ensureSessionId());
+        setKimiMdStale(false);
+        kimiMdStaleNudgedRef.current = false;
       }
     } catch (e) {
       if ((e as Error).name === "AbortError") {
@@ -1768,6 +1839,9 @@ function App({
       if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
       setBusy(false);
       setTurnStartedAt(null);
+      setTurnPhase("waiting");
+      setCurrentToolName(null);
+      setLastActivityAt(null);
       activeAsstIdRef.current = null;
       activeControllerRef.current = null;
       permResolveRef.current = null;
@@ -1779,20 +1853,19 @@ function App({
   const handleThemePick = useCallback(
     (picked: Theme | null) => {
       setShowThemePicker(false);
-      setOriginalTheme(null);
-      if (!picked) {
-        if (originalTheme) setTheme(originalTheme);
-        return;
-      }
-      setTheme(picked);
-      setCfg((c) => (c ? { ...c, theme: picked.name } : c));
-      if (cfg) void saveConfig({ ...cfg, theme: picked.name }).catch(() => {});
+      if (!picked) return;
+      setCfg((c) => {
+        if (!c) return c;
+        const updated = { ...c, theme: picked.name };
+        void saveConfig(updated).catch(() => {});
+        return updated;
+      });
       setEvents((e) => [
         ...e,
-        { kind: "info", key: mkKey(), text: `theme: ${picked.label}` },
+        { kind: "info", key: mkKey(), text: `theme: ${picked.label} — restart to apply` },
       ]);
     },
-    [cfg, originalTheme],
+    [],
   );
 
   const handleResumePick = useCallback(
@@ -2114,7 +2187,6 @@ function App({
       }
       if (c === "/theme") {
         if (!arg) {
-          setOriginalTheme(theme);
           setShowThemePicker(true);
           return true;
         }
@@ -2126,12 +2198,15 @@ function App({
           ]);
           return true;
         }
-        setTheme(next);
-        setCfg((c) => (c ? { ...c, theme: next.name } : c));
-        if (cfg) void saveConfig({ ...cfg, theme: next.name }).catch(() => {});
+        setCfg((prev) => {
+          if (!prev) return prev;
+          const updated = { ...prev, theme: next.name };
+          void saveConfig(updated).catch(() => {});
+          return updated;
+        });
         setEvents((e) => [
           ...e,
-          { kind: "info", key: mkKey(), text: `theme: ${next.label}` },
+          { kind: "info", key: mkKey(), text: `theme: ${next.label} — restart to apply` },
         ]);
         return true;
       }
@@ -2148,6 +2223,125 @@ function App({
       if (c === "/edit") {
         setMode("edit");
         setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "mode: edit" }]);
+        return true;
+      }
+      if (c === "/skills") {
+        const sub = rest[0]?.toLowerCase() ?? "";
+        const subRest = rest.slice(1).join(" ").trim();
+
+        if (sub === "list" || sub === "") {
+          void listAllSkills(process.cwd()).then((all) => {
+            const lines: string[] = [];
+            if (all.project.length > 0) {
+              lines.push("project skills:");
+              for (const s of all.project) {
+                const status = s.enabled ? "✓" : "✗";
+                lines.push(`  ${status} ${s.name} — ${s.description || "no description"} (${s.estimatedTokens} tokens)`);
+              }
+            }
+            if (all.global.length > 0) {
+              lines.push("global skills:");
+              for (const s of all.global) {
+                const status = s.enabled ? "✓" : "✗";
+                lines.push(`  ${status} ${s.name} — ${s.description || "no description"} (${s.estimatedTokens} tokens)`);
+              }
+            }
+            if (lines.length === 0) {
+              lines.push("no skills found. create one with /skills add <name>");
+            }
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: lines.join("\n") }]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to list skills: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        if (sub === "add") {
+          const name = subRest.trim();
+          if (!name) {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /skills add <name>" }]);
+            return true;
+          }
+          void createSkill({ name, scope: "project", cwd: process.cwd() }).then((result) => {
+            setEvents((e) => [
+              ...e,
+              { kind: "info", key: mkKey(), text: `created skill '${name}' → ${result.filepath}` },
+              { kind: "info", key: mkKey(), text: `edit the file to add your instructions` },
+            ]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to create skill: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        if (sub === "edit") {
+          const name = subRest.trim();
+          if (!name) {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /skills edit <name>" }]);
+            return true;
+          }
+          void findSkillFile(name, process.cwd()).then((filepath) => {
+            if (!filepath) {
+              setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `skill '${name}' not found` }]);
+              return;
+            }
+            setEvents((e) => [
+              ...e,
+              { kind: "info", key: mkKey(), text: `skill '${name}' → ${filepath}` },
+              { kind: "info", key: mkKey(), text: `open it in your editor to make changes` },
+            ]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to find skill: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        if (sub === "delete") {
+          const name = subRest.trim();
+          if (!name) {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /skills delete <name>" }]);
+            return true;
+          }
+          void deleteSkill(name, process.cwd()).then((result) => {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `deleted skill '${name}' (${result.filepath})` }]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to delete skill: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        if (sub === "enable") {
+          const name = subRest.trim();
+          if (!name) {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /skills enable <name>" }]);
+            return true;
+          }
+          void setSkillEnabled(name, true, process.cwd()).then((result) => {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `enabled skill '${name}' (${result.filepath})` }]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to enable skill: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        if (sub === "disable") {
+          const name = subRest.trim();
+          if (!name) {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /skills disable <name>" }]);
+            return true;
+          }
+          void setSkillEnabled(name, false, process.cwd()).then((result) => {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `disabled skill '${name}' (${result.filepath})` }]);
+          }).catch((err) => {
+            setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `failed to disable skill: ${(err as Error).message}` }]);
+          });
+          return true;
+        }
+
+        setEvents((e) => [
+          ...e,
+          { kind: "info", key: mkKey(), text: "usage: /skills list | add <name> | edit <name> | delete <name> | enable <name> | disable <name>" },
+        ]);
         return true;
       }
       if (c === "/memory") {
@@ -2565,23 +2759,26 @@ function App({
         return true;
       }
       if (c === "/help") {
-        setShowHelpMenu(true);
+        const lines = [
+          "commands:",
+          "  /mode edit|plan|auto     switch agent mode",
+          "  /thinking low|medium|high set reasoning effort",
+          "  /skills list|add|edit|... manage skills",
+          "  /memory on|off|clear      manage memory",
+          "  /cost                     show cost report",
+          "  /compact                  summarize old turns",
+          "  /resume                   pick a past session",
+          "  /clear                    clear conversation",
+          "  /init                     scan repo and write KIMI.md",
+          "  /update                   check for updates",
+          "  /exit                     exit kimiflare",
+        ];
+        setEvents((e) => [...e, { kind: "info", key: mkKey(), text: lines.join("\n") }]);
         return true;
       }
       return false;
     },
     [cfg, exit, usage, effort, theme, mode, openResumePicker, runCompact, runInit, initMcp, setCfg, setShowRemoteDashboard, setSelectedRemoteSession],
-  );
-
-  const handleHelpCommand = useCallback(
-    (command: string) => {
-      setShowHelpMenu(false);
-      const executed = handleSlash(command);
-      if (!executed) {
-        setEvents((e) => [...e, { kind: "error", key: mkKey(), text: `unknown command: ${command}` }]);
-      }
-    },
-    [handleSlash],
   );
 
   const handleCommandSave = useCallback(
@@ -2728,12 +2925,42 @@ function App({
         }
       }
 
+      // Occasional gentle nudge about /init (educational, not a warning)
+      turnCounterRef.current += 1;
+      if (
+        turnCounterRef.current % 15 === 0 &&
+        existsSync(join(process.cwd(), "KIMI.md")) &&
+        !kimiMdStale
+      ) {
+        setEvents((e) => [
+          ...e,
+          { kind: "info", key: mkKey(), text: "Tip: Rerunning /init occasionally helps KimiFlare stay accurate as your project evolves." },
+        ]);
+      }
+
       setBusy(true);
       gatewayMetaRef.current = null;
       setGatewayMeta(null);
       setTurnStartedAt(Date.now());
 
       const classification = classifyIntent(trimmed);
+      setIntentTier(classification.tier);
+
+      // Route skills based on intent tier
+      let skillResult: SkillRoutingResult | undefined;
+      try {
+        skillResult = await routeSkills(skillsDirRef.current, {
+          cwd: process.cwd(),
+          prompt: trimmed,
+          memorySnippets: [], // TODO: wire memory snippets when available
+          tier: classification.tier,
+          maxSkillTokens: CONTEXT_LIMIT - 10_000, // leave headroom
+        });
+        setSkillsActive(skillResult.selectedSkills.length);
+      } catch {
+        setSkillsActive(0);
+      }
+
       const effortForTier: Record<string, ReasoningEffort> = {
         light: "low",
         medium: "medium",
@@ -2743,6 +2970,44 @@ function App({
       const effectiveCodeMode = classification.tier === "heavy";
       setCodeMode(effectiveCodeMode);
 
+      // Inject selected skills into system prompt
+      const selectedSkills = skillResult?.selectedSkills.map((s) => ({ name: s.name, body: s.body }));
+      if (cacheStableRef.current) {
+        messagesRef.current[1] = {
+          role: "system",
+          content: buildSessionPrefix({
+            cwd: process.cwd(),
+            tools: [...ALL_TOOLS, ...mcpToolsRef.current, ...lspToolsRef.current],
+            model: cfg.model,
+            mode: modeRef.current,
+            selectedSkills,
+          }),
+        };
+      } else {
+        messagesRef.current[0] = {
+          role: "system",
+          content: buildSystemPrompt({
+            cwd: process.cwd(),
+            tools: [...ALL_TOOLS, ...mcpToolsRef.current, ...lspToolsRef.current],
+            model: cfg.model,
+            mode: modeRef.current,
+            selectedSkills,
+          }),
+        };
+      }
+
+      // Emit metadata banner
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "meta",
+          key: mkKey(),
+          intentTier: classification.tier,
+          skillsActive: skillResult?.selectedSkills.length ?? 0,
+          memoryRecalled: false,
+        },
+      ]);
+
       const controller = new AbortController();
       activeControllerRef.current = controller;
 
@@ -2750,6 +3015,8 @@ function App({
         onAssistantStart: () => {
           const id = nextAssistantId++;
           activeAsstIdRef.current = id;
+          setTurnPhase("generating");
+          setLastActivityAt(Date.now());
           setEvents((e) => [
             ...e,
             { kind: "assistant", key: `asst_${id}`, id, text: "", reasoning: "", streaming: true },
@@ -2758,17 +3025,23 @@ function App({
         onReasoningDelta: (d: string) => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, (e) => ({ reasoning: e.reasoning + d }));
+          setLastActivityAt(Date.now());
         },
         onTextDelta: (d: string) => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, (e) => ({ text: e.text + d }));
+          setLastActivityAt(Date.now());
         },
         onAssistantFinal: () => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, () => ({ streaming: false }));
+          setTurnPhase("waiting");
         },
         onToolCallFinalized: (call: import("./agent/messages.js").ToolCall) => {
           pendingToolCallsRef.current.set(call.id, call.function.name);
+          setTurnPhase("executing");
+          setCurrentToolName(call.function.name);
+          setLastActivityAt(Date.now());
           const spec = executorRef.current.list().find((t) => t.name === call.function.name);
           let renderMeta: ToolRender | undefined;
           try {
@@ -2788,11 +3061,17 @@ function App({
               status: "running",
               render: renderMeta,
               expanded: false,
+              startedAt: Date.now(),
             },
           ]);
         },
         onToolResult: (r: import("./tools/executor.js").ToolResult) => {
           pendingToolCallsRef.current.delete(r.tool_call_id);
+          setLastActivityAt(Date.now());
+          if (pendingToolCallsRef.current.size === 0) {
+            setTurnPhase("waiting");
+            setCurrentToolName(null);
+          }
           updateTool(r.tool_call_id, {
             status: r.ok ? "done" : "error",
             result: r.content,
@@ -2866,6 +3145,16 @@ function App({
             limitResolveRef.current = resolve;
             setLimitModal({ limit: 50, resolve });
           }),
+        onKimiMdStale: () => {
+          if (!kimiMdStaleNudgedRef.current) {
+            kimiMdStaleNudgedRef.current = true;
+            setKimiMdStale(true);
+            setEvents((e) => [
+              ...e,
+              { kind: "info", key: mkKey(), text: "Project context may be stale. Run /init to refresh KIMI.md based on recent changes." },
+            ]);
+          }
+        },
       };
 
       try {
@@ -2893,6 +3182,7 @@ function App({
           cloudDeviceId: cloudDeviceId ?? initialCloudDeviceId,
           onIterationEnd,
           intentClassification: classification,
+          selectedSkills,
           onFileChange: (path, content) => {
             if (content) {
               lspManagerRef.current.notifyChange(path, content);
@@ -3040,6 +3330,9 @@ function App({
         if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
         setBusy(false);
         setTurnStartedAt(null);
+        setTurnPhase("waiting");
+        setCurrentToolName(null);
+        setLastActivityAt(null);
         activeAsstIdRef.current = null;
         activeControllerRef.current = null;
         permResolveRef.current = null;
@@ -3179,24 +3472,6 @@ function App({
     );
   }
 
-  if (showHelpMenu) {
-    return (
-      <ThemeProvider theme={theme}>
-        <Box flexDirection="column">
-          <HelpMenu
-            customCommands={customCommandsRef.current
-              .filter((c) => !BUILTIN_COMMAND_NAMES.has(c.name.toLowerCase()))
-              .map((c) => ({ name: c.name, description: c.description }))}
-            costAttributionEnabled={cfg?.costAttribution}
-            cloudMode={cfg?.cloudMode}
-            onDone={() => setShowHelpMenu(false)}
-            onCommand={handleHelpCommand}
-          />
-        </Box>
-      </ThemeProvider>
-    );
-  }
-
   if (showLspWizard) {
     return (
       <ThemeProvider theme={theme}>
@@ -3325,7 +3600,7 @@ function App({
     return (
       <ThemeProvider theme={theme}>
         <Box flexDirection="column">
-          <ThemePicker themes={themeList()} onPick={handleThemePick} onPreview={(t) => setTheme(t)} />
+          <ThemePicker themes={themeList()} onPick={handleThemePick} />
         </Box>
       </ThemeProvider>
     );
@@ -3337,7 +3612,7 @@ function App({
     <ThemeProvider theme={theme}>
       <Box flexDirection="column">
         {!hasConversation && events.length === 0 ? (
-          <Welcome accountId={cfg.accountId} />
+          <Welcome accountId={cfg.accountId} cloudMode={cfg.cloudMode} />
         ) : (
           <ChatView events={events} showReasoning={showReasoning} verbose={verbose} />
         )}
@@ -3393,6 +3668,13 @@ function App({
               codeMode={codeMode}
               cloudMode={cfg.cloudMode}
               cloudBudget={cloudBudget}
+              skillsActive={skillsActive}
+              memoryRecalled={memoryRecalled}
+              phase={turnPhase}
+              currentTool={currentToolName}
+              lastActivityAt={lastActivityAt}
+              kimiMdStale={kimiMdStale}
+              gitBranch={gitBranch}
             />
             {activePicker?.kind === "file" && (
               <FilePicker

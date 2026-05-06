@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.44.0](https://github.com/sinameraji/kimiflare/compare/v0.43.0...v0.44.0) (2026-05-06)
+
+
+### Features
+
+* **ui:** show current git branch in status bar ([#311](https://github.com/sinameraji/kimiflare/issues/311)) ([df69ebe](https://github.com/sinameraji/kimiflare/commit/df69ebe5a868d95b788471f7f618857906d2a716))
+* **ui:** show mode-cycle tip in status bar ([#309](https://github.com/sinameraji/kimiflare/issues/309)) ([1f067f8](https://github.com/sinameraji/kimiflare/commit/1f067f8f98f5321b01b416af47682f112fef51bf))
+
+
+### Bug Fixes
+
+* **ui:** restore tool-card visibility in plan mode ([#312](https://github.com/sinameraji/kimiflare/issues/312)) ([c14f022](https://github.com/sinameraji/kimiflare/commit/c14f022f5183c150dec4a5f39055f71b89809ed0))
+
+## [0.43.0](https://github.com/sinameraji/kimiflare/compare/v0.42.0...v0.43.0) (2026-05-06)
+
+
+### Features
+
+* **skills:** implement tiered skill routing with TUI visibility ([#298](https://github.com/sinameraji/kimiflare/issues/298)) ([809e06e](https://github.com/sinameraji/kimiflare/commit/809e06ee7757dd37285853756ffa3ef922ea5e9c))
+
+
+### Bug Fixes
+
+* **ui:** hide Cloudflare billing link in cloud mode ([#307](https://github.com/sinameraji/kimiflare/issues/307)) ([4f9b93f](https://github.com/sinameraji/kimiflare/commit/4f9b93f05a63c2f1b81ad7607c664820b87973f3))
+
+## [0.42.0](https://github.com/sinameraji/kimiflare/compare/v0.41.0...v0.42.0) (2026-05-06)
+
+
+### Features
+
+* **ui:** extensible JSON themes with WCAG contrast validation ([#302](https://github.com/sinameraji/kimiflare/issues/302)) ([bced1f7](https://github.com/sinameraji/kimiflare/commit/bced1f7b18b46e601f93911fdf242b390a54b22c))
+* **ui:** improve progress visibility during agent turns ([#299](https://github.com/sinameraji/kimiflare/issues/299)) ([7c4f44e](https://github.com/sinameraji/kimiflare/commit/7c4f44e18b4b291a0dbace34b64d193f49349c25))
+
+## [0.41.0](https://github.com/sinameraji/kimiflare/compare/v0.40.0...v0.41.0) (2026-05-06)
+
+
+### Features
+
+* KIMI.md drift detection with memory-based staleness indicators ([#303](https://github.com/sinameraji/kimiflare/issues/303)) ([052b46c](https://github.com/sinameraji/kimiflare/commit/052b46c614fae8d3a30bd3fc4e9741ab987bdef6))
+
+## [0.40.0](https://github.com/sinameraji/kimiflare/compare/v0.39.1...v0.40.0) (2026-05-06)
+
+
+### Features
+
+* **ui:** narrative activity layer, plan-mode suppression, and interruption cleanup ([#300](https://github.com/sinameraji/kimiflare/issues/300)) ([085d2ea](https://github.com/sinameraji/kimiflare/commit/085d2eabf4dbd9667783fa1d1228223493ea7bba))
+
+## [0.39.1](https://github.com/sinameraji/kimiflare/compare/v0.39.0...v0.39.1) (2026-05-06)
+
+
+### Bug Fixes
+
+* **app:** update /hello feedback worker URL to hello.kimiflare.com ([#292](https://github.com/sinameraji/kimiflare/issues/292)) ([376eaed](https://github.com/sinameraji/kimiflare/commit/376eaed67ab64b54502d2fd5116df92729178da1))
+* **build:** remove logMemory import and calls ([#297](https://github.com/sinameraji/kimiflare/issues/297)) ([ef5b22c](https://github.com/sinameraji/kimiflare/commit/ef5b22caf65eeaed30028949cafd428eb47aae92))
+* **ui:** remove live theme preview to prevent memory leak ([#296](https://github.com/sinameraji/kimiflare/issues/296)) ([2980dc9](https://github.com/sinameraji/kimiflare/commit/2980dc98c6550d0a392b3772bdf82fd25ba5e266))
+
 ## [0.39.0](https://github.com/sinameraji/kimiflare/compare/v0.38.1...v0.39.0) (2026-05-06)
 
 
